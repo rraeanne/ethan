@@ -1,0 +1,239 @@
+import os
+import sqlite3
+
+DB_PATH = os.getenv('DATABASE_PATH', 'bot/expenses.db')
+
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ensure_column(cursor, table_name, column_name, definition):
+    try:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+    except sqlite3.OperationalError:
+        # Column already exists in existing deployments.
+        pass
+
+def init_db():
+    """Initialize the database with required tables and lightweight migrations."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        '''
+    )
+
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS partners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_a INTEGER NOT NULL,
+            user_b INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_a, user_b),
+            FOREIGN KEY (user_a) REFERENCES users (user_id),
+            FOREIGN KEY (user_b) REFERENCES users (user_id)
+        )
+        '''
+    )
+
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            description TEXT,
+            category TEXT,
+            paid_by TEXT,
+            is_shared INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        '''
+    )
+
+    # Keep older databases compatible.
+    _ensure_column(cursor, 'expenses', 'paid_by', 'TEXT')
+    _ensure_column(cursor, 'expenses', 'is_shared', 'INTEGER DEFAULT 0')
+
+    conn.commit()
+    conn.close()
+
+def add_or_get_user(user_id, username):
+    """Add or update a user."""
+    normalized_username = username.lower().lstrip('@') if username else None
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        INSERT INTO users (user_id, username)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
+        ''',
+        (user_id, normalized_username),
+    )
+
+    conn.commit()
+    conn.close()
+
+def set_partner_by_username(user_id, partner_username):
+    """Link two users as partners. Partner must have started the bot already."""
+    normalized = partner_username.lower().lstrip('@')
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT user_id FROM users WHERE username = ?', (normalized,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False, 'Partner not found. Ask them to /start the bot first.'
+
+    partner_id = row['user_id']
+    if partner_id == user_id:
+        conn.close()
+        return False, 'You cannot set yourself as partner.'
+
+    user_a = min(user_id, partner_id)
+    user_b = max(user_id, partner_id)
+
+    cursor.execute('INSERT OR IGNORE INTO partners (user_a, user_b) VALUES (?, ?)', (user_a, user_b))
+    conn.commit()
+    conn.close()
+    return True, normalized
+
+def get_partner_id(user_id):
+    """Return partner user_id if linked, otherwise None."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END AS partner_id
+        FROM partners
+        WHERE user_a = ? OR user_b = ?
+        LIMIT 1
+        ''',
+        (user_id, user_id, user_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row['partner_id'] if row else None
+
+def get_username(user_id):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('SELECT username FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return row['username']
+
+def add_expense(user_id, amount, description, category, is_shared=False, paid_by=None):
+    """Add an expense to the database."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        INSERT INTO expenses (user_id, amount, description, category, paid_by, is_shared)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''',
+        (user_id, amount, description, category, paid_by or 'unknown', 1 if is_shared else 0),
+    )
+
+    expense_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return expense_id
+
+def get_user_balance(user_id):
+    """Return personal totals and shared 50/50 settlement math for a linked couple."""
+    partner_id = get_partner_id(user_id)
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 0', (user_id,))
+    personal_total = float(cursor.fetchone()['total'])
+
+    if partner_id is None:
+        conn.close()
+        return {
+            'personal_total': personal_total,
+            'shared_paid': 0.0,
+            'shared_owed': 0.0,
+            'shared_balance': 0.0,
+            'overall_total': personal_total,
+            'partner_username': None,
+        }
+
+    cursor.execute(
+        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1',
+        (user_id,),
+    )
+    shared_paid = float(cursor.fetchone()['total'])
+
+    cursor.execute(
+        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1',
+        (partner_id,),
+    )
+    partner_shared_paid = float(cursor.fetchone()['total'])
+
+    shared_pool = shared_paid + partner_shared_paid
+    shared_owed = shared_pool / 2.0
+    shared_balance = shared_paid - shared_owed
+
+    partner_username = get_username(partner_id)
+    conn.close()
+
+    return {
+        'personal_total': personal_total,
+        'shared_paid': shared_paid,
+        'shared_owed': shared_owed,
+        'shared_balance': shared_balance,
+        'overall_total': personal_total + shared_owed,
+        'partner_username': partner_username,
+    }
+
+def get_all_expenses(user_id):
+    """Get expenses for the user and, if linked, their partner too."""
+    partner_id = get_partner_id(user_id)
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    if partner_id is None:
+        cursor.execute(
+            '''
+            SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+            FROM expenses
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            ''',
+            (user_id,),
+        )
+    else:
+        cursor.execute(
+            '''
+            SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+            FROM expenses
+            WHERE user_id IN (?, ?)
+            ORDER BY created_at DESC
+            ''',
+            (user_id, partner_id),
+        )
+
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
