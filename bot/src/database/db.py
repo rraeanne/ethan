@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import date, datetime, time, timedelta
 
 DB_PATH = os.getenv('DATABASE_PATH', 'bot/expenses.db')
 
@@ -14,6 +15,35 @@ def _ensure_column(cursor, table_name, column_name, definition):
     except sqlite3.OperationalError:
         # Column already exists in existing deployments.
         pass
+
+def _current_week_start():
+    today = date.today()
+    return today - timedelta(days=today.weekday())
+
+def _normalize_week_start(week_start=None):
+    if week_start is None:
+        return _current_week_start()
+
+    if isinstance(week_start, date):
+        return week_start - timedelta(days=week_start.weekday())
+
+    if isinstance(week_start, datetime):
+        week_date = week_start.date()
+        return week_date - timedelta(days=week_date.weekday())
+
+    parsed = datetime.fromisoformat(str(week_start)).date()
+    return parsed - timedelta(days=parsed.weekday())
+
+def _week_bounds(week_start=None):
+    week_date = _normalize_week_start(week_start)
+    start_dt = datetime.combine(week_date, time.min)
+    end_dt = start_dt + timedelta(days=7)
+    return start_dt.strftime('%Y-%m-%d %H:%M:%S'), end_dt.strftime('%Y-%m-%d %H:%M:%S'), week_date
+
+def _expense_week_start(created_at):
+    parsed = datetime.fromisoformat(str(created_at))
+    week_start = parsed.date() - timedelta(days=parsed.date().weekday())
+    return week_start.isoformat()
 
 def init_db():
     """Initialize the database with required tables and lightweight migrations."""
@@ -157,19 +187,24 @@ def add_expense(user_id, amount, description, category, is_shared=False, paid_by
     conn.close()
     return expense_id
 
-def get_user_balance(user_id):
-    """Return personal totals and shared 50/50 settlement math for a linked couple."""
+def get_user_balance(user_id, week_start=None):
+    """Return weekly personal totals and shared 50/50 settlement math for a linked couple."""
     partner_id = get_partner_id(user_id)
+    week_start_value, week_end_value, week_date = _week_bounds(week_start)
 
     conn = _get_conn()
     cursor = conn.cursor()
 
-    cursor.execute('SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 0', (user_id,))
+    cursor.execute(
+        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 0 AND created_at >= ? AND created_at < ?',
+        (user_id, week_start_value, week_end_value),
+    )
     personal_total = float(cursor.fetchone()['total'])
 
     if partner_id is None:
         conn.close()
         return {
+            'week_start': week_date.isoformat(),
             'personal_total': personal_total,
             'shared_paid': 0.0,
             'shared_owed': 0.0,
@@ -179,14 +214,14 @@ def get_user_balance(user_id):
         }
 
     cursor.execute(
-        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1',
-        (user_id,),
+        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1 AND created_at >= ? AND created_at < ?',
+        (user_id, week_start_value, week_end_value),
     )
     shared_paid = float(cursor.fetchone()['total'])
 
     cursor.execute(
-        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1',
-        (partner_id,),
+        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1 AND created_at >= ? AND created_at < ?',
+        (partner_id, week_start_value, week_end_value),
     )
     partner_shared_paid = float(cursor.fetchone()['total'])
 
@@ -198,6 +233,7 @@ def get_user_balance(user_id):
     conn.close()
 
     return {
+        'week_start': week_date.isoformat(),
         'personal_total': personal_total,
         'shared_paid': shared_paid,
         'shared_owed': shared_owed,
@@ -206,9 +242,10 @@ def get_user_balance(user_id):
         'partner_username': partner_username,
     }
 
-def get_all_expenses(user_id):
-    """Get expenses for the user and, if linked, their partner too."""
+def get_all_expenses(user_id, week_start=None):
+    """Get weekly expenses for the user and, if linked, their partner too."""
     partner_id = get_partner_id(user_id)
+    week_start_value, week_end_value, week_date = _week_bounds(week_start)
 
     conn = _get_conn()
     cursor = conn.cursor()
@@ -218,6 +255,38 @@ def get_all_expenses(user_id):
             '''
             SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
             FROM expenses
+            WHERE user_id = ? AND created_at >= ? AND created_at < ?
+            ORDER BY created_at DESC
+            ''',
+            (user_id, week_start_value, week_end_value),
+        )
+    else:
+        cursor.execute(
+            '''
+            SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+            FROM expenses
+            WHERE user_id IN (?, ?) AND created_at >= ? AND created_at < ?
+            ORDER BY created_at DESC
+            ''',
+            (user_id, partner_id, week_start_value, week_end_value),
+        )
+
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def get_expense_weeks(user_id, limit=8):
+    """Return available week starts for the user and partner, newest first."""
+    partner_id = get_partner_id(user_id)
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    if partner_id is None:
+        cursor.execute(
+            '''
+            SELECT created_at
+            FROM expenses
             WHERE user_id = ?
             ORDER BY created_at DESC
             ''',
@@ -226,7 +295,7 @@ def get_all_expenses(user_id):
     else:
         cursor.execute(
             '''
-            SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+            SELECT created_at
             FROM expenses
             WHERE user_id IN (?, ?)
             ORDER BY created_at DESC
@@ -236,7 +305,16 @@ def get_all_expenses(user_id):
 
     rows = cursor.fetchall()
     conn.close()
-    return rows
+
+    seen = []
+    for row in rows:
+        week_start = _expense_week_start(row['created_at'])
+        if week_start not in seen:
+            seen.append(week_start)
+        if len(seen) >= limit:
+            break
+
+    return seen
 
 def get_user_expenses(user_id, limit=10):
     """Get only the current user's own expenses (for editing/deleting)."""
