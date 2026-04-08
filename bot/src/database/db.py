@@ -237,3 +237,65 @@ def get_all_expenses(user_id):
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+def get_user_expenses(user_id, limit=10):
+    """Get only the current user's own expenses (for editing/deleting)."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+        FROM expenses
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        ''',
+        (user_id, limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def delete_expense(expense_id, user_id):
+    """Delete an expense. Only succeeds if it belongs to user_id."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        'DELETE FROM expenses WHERE id = ? AND user_id = ?',
+        (expense_id, user_id),
+    )
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+def update_expense(expense_id, user_id, amount=None, description=None, category=None):
+    """Update fields of an expense. Only succeeds if it belongs to user_id."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    updates = []
+    values = []
+    if amount is not None:
+        updates.append('amount = ?')
+        values.append(amount)
+    if description is not None:
+        updates.append('description = ?')
+        values.append(description)
+    if category is not None:
+        updates.append('category = ?')
+        values.append(category)
+
+    if not updates:
+        conn.close()
+        return False
+
+    values.extend([expense_id, user_id])
+    cursor.execute(
+        f"UPDATE expenses SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+        values,
+    )
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
