@@ -2,7 +2,7 @@ import os
 import sqlite3
 from datetime import date, datetime, time, timedelta
 
-DB_PATH = os.getenv('DATABASE_PATH', 'bot/expenses.db')
+DB_PATH = os.getenv('DATABASE_PATH', 'expenses.db')
 
 def _get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -170,25 +170,49 @@ def get_username(user_id):
     return row['username']
 
 def add_expense(user_id, amount, description, category, is_shared=False, paid_by=None):
-    """Add an expense to the database."""
+    """Add an expense to the database. If shared, splits evenly between both personal accounts."""
     conn = _get_conn()
     cursor = conn.cursor()
-
-    cursor.execute(
-        '''
-        INSERT INTO expenses (user_id, amount, description, category, paid_by, is_shared)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''',
-        (user_id, amount, description, category, paid_by or 'unknown', 1 if is_shared else 0),
-    )
-
+    
+    if is_shared:
+        partner_id = get_partner_id(user_id)
+        if partner_id is None:
+            conn.close()
+            return None
+        
+        half_amount = amount / 2.0
+        
+        cursor.execute(
+            '''
+            INSERT INTO expenses (user_id, amount, description, category, paid_by, is_shared)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (user_id, half_amount, f"{description} (split)", category, paid_by or 'unknown', 0),
+        )
+        
+        cursor.execute(
+            '''
+            INSERT INTO expenses (user_id, amount, description, category, paid_by, is_shared)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (partner_id, half_amount, f"{description} (split)", category, paid_by or 'unknown', 0),
+        )
+    else:
+        cursor.execute(
+            '''
+            INSERT INTO expenses (user_id, amount, description, category, paid_by, is_shared)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (user_id, amount, description, category, paid_by or 'unknown', 0),
+        )
+    
     expense_id = cursor.lastrowid
     conn.commit()
     conn.close()
     return expense_id
 
 def get_user_balance(user_id, week_start=None):
-    """Return weekly personal totals and shared 50/50 settlement math for a linked couple."""
+    """Return weekly total expenses for the user."""
     partner_id = get_partner_id(user_id)
     week_start_value, week_end_value, week_date = _week_bounds(week_start)
 
@@ -196,49 +220,20 @@ def get_user_balance(user_id, week_start=None):
     cursor = conn.cursor()
 
     cursor.execute(
-        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 0 AND created_at >= ? AND created_at < ?',
+        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND created_at >= ? AND created_at < ?',
         (user_id, week_start_value, week_end_value),
     )
-    personal_total = float(cursor.fetchone()['total'])
+    total = float(cursor.fetchone()['total'])
 
-    if partner_id is None:
-        conn.close()
-        return {
-            'week_start': week_date.isoformat(),
-            'personal_total': personal_total,
-            'shared_paid': 0.0,
-            'shared_owed': 0.0,
-            'shared_balance': 0.0,
-            'overall_total': personal_total,
-            'partner_username': None,
-        }
+    partner_username = None
+    if partner_id:
+        partner_username = get_username(partner_id)
 
-    cursor.execute(
-        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1 AND created_at >= ? AND created_at < ?',
-        (user_id, week_start_value, week_end_value),
-    )
-    shared_paid = float(cursor.fetchone()['total'])
-
-    cursor.execute(
-        'SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = ? AND is_shared = 1 AND created_at >= ? AND created_at < ?',
-        (partner_id, week_start_value, week_end_value),
-    )
-    partner_shared_paid = float(cursor.fetchone()['total'])
-
-    shared_pool = shared_paid + partner_shared_paid
-    shared_owed = shared_pool / 2.0
-    shared_balance = shared_paid - shared_owed
-
-    partner_username = get_username(partner_id)
     conn.close()
 
     return {
         'week_start': week_date.isoformat(),
-        'personal_total': personal_total,
-        'shared_paid': shared_paid,
-        'shared_owed': shared_owed,
-        'shared_balance': shared_balance,
-        'overall_total': personal_total + shared_owed,
+        'total': total,
         'partner_username': partner_username,
     }
 
@@ -253,7 +248,7 @@ def get_all_expenses(user_id, week_start=None):
     if partner_id is None:
         cursor.execute(
             '''
-            SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+            SELECT id, user_id, amount, description, category, paid_by, created_at
             FROM expenses
             WHERE user_id = ? AND created_at >= ? AND created_at < ?
             ORDER BY created_at DESC
@@ -263,7 +258,7 @@ def get_all_expenses(user_id, week_start=None):
     else:
         cursor.execute(
             '''
-            SELECT id, user_id, amount, description, category, paid_by, is_shared, created_at
+            SELECT id, user_id, amount, description, category, paid_by, created_at
             FROM expenses
             WHERE user_id IN (?, ?) AND created_at >= ? AND created_at < ?
             ORDER BY created_at DESC

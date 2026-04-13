@@ -1,9 +1,11 @@
 import os
 import logging
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from database.db import (
     init_db,
@@ -59,7 +61,7 @@ def format_week_range(week_start):
 
 def main_menu_markup():
     keyboard = [
-        ['➕ Add Expense', '💰 My Balance'],
+        ['➕ Add Expense', '💰 Our Balance'],
         ['📊 View Expenses', '📅 WEEKLY'],
         ['🔗 Set Partner'],
         ['✏️ Edit Expense', '🗑 Delete Expense'],
@@ -71,10 +73,8 @@ def format_expense_list(expenses):
     """Format a numbered list of expenses for display."""
     lines = []
     for i, e in enumerate(expenses, 1):
-        scope = 'Shared' if e['is_shared'] else 'Personal'
         lines.append(
-            f"{i}. ${e['amount']:.2f} — {e['description']} ({e['category']}, {scope})\n"
-            f"   {e['created_at'][:10]}"
+            f"{i}. ${e['amount']:.2f} — {e['description']} ({e['category']})"
         )
     return '\n\n'.join(lines)
 
@@ -126,20 +126,10 @@ async def send_weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
     week_label = format_week_range(selected_week)
 
     msg = f"📅 WEEKLY\n\nWeek: {week_label}\n\n"
-    msg += f"Personal spending: ${balance['personal_total']:.2f}\n"
-    msg += f"Your shared paid: ${balance['shared_paid']:.2f}\n"
-    msg += f"Your shared half: ${balance['shared_owed']:.2f}\n"
-    msg += f"Your total: ${balance['overall_total']:.2f}\n"
+    msg += f"Total spending: ${balance['total']:.2f}\n"
 
     if partner_name:
-        msg += f"\nPartner: @{partner_name}\n"
-        msg += f"Shared net: ${balance['shared_balance']:.2f}\n"
-        if balance['shared_balance'] > 0:
-            msg += "Your partner owes you."
-        elif balance['shared_balance'] < 0:
-            msg += "You owe your partner."
-        else:
-            msg += "Shared spending is even."
+        msg += f"\nPartner: @{partner_name}"
     else:
         msg += "\nNo partner linked yet. Use /partner @username"
 
@@ -226,9 +216,9 @@ async def description_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def category_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['category'] = update.message.text
-    keyboard = [['Shared (split 50/50)', 'Personal']]
+    keyboard = [['Split with Partner 50/50', 'Personal Only']]
     await update.message.reply_text(
-        "Is this a shared expense?",
+        "Who is paying?",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     )
     return SPLIT_USERS
@@ -238,9 +228,9 @@ async def split_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount = context.user_data['amount']
     description = context.user_data['description']
     category = context.user_data['category']
-    is_shared = update.message.text == 'Shared (split 50/50)'
+    is_split = update.message.text == 'Split with Partner 50/50'
 
-    if is_shared and get_partner_id(user.id) is None:
+    if is_split and get_partner_id(user.id) is None:
         await update.message.reply_text(
             "Set your partner first.\nUse: /partner @username",
             reply_markup=main_menu_markup()
@@ -249,13 +239,14 @@ async def split_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_expense(
         user.id, amount, description, category,
-        is_shared=is_shared,
+        is_shared=is_split,
         paid_by=user.username or f"user_{user.id}"
     )
 
-    msg = f"✅ Expense recorded!\n\nAmount: ${amount:.2f}\nDescription: {description}\nCategory: {category}\nType: {'Shared' if is_shared else 'Personal'}"
-    if is_shared:
-        msg += f"\nSplit: ${amount/2:.2f} added to each account"
+    if is_split:
+        msg = f"✅ Expense recorded!\n\nAmount: ${amount:.2f} total\nYour share: ${amount/2:.2f}\nPartner's share: ${amount/2:.2f}\nDescription: {description}\nCategory: {category}"
+    else:
+        msg = f"✅ Expense recorded!\n\nAmount: ${amount:.2f}\nDescription: {description}\nCategory: {category}\nType: Personal"
 
     await update.message.reply_text(msg, reply_markup=main_menu_markup())
     return ConversationHandler.END
@@ -427,22 +418,15 @@ async def view_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     week_label = format_week_range(current_week_start())
 
     msg = f"💰 This Week\n\nWeek: {week_label}\n\n"
-    msg += f"Personal spending: ${balance['personal_total']:.2f}\n"
-    msg += f"Your shared paid: ${balance['shared_paid']:.2f}\n"
-    msg += f"Your shared half: ${balance['shared_owed']:.2f}\n"
-    msg += f"Your total: ${balance['overall_total']:.2f}\n\n"
+    msg += f"You spent: ${balance['total']:.2f}\n"
 
     if balance['partner_username']:
-        msg += f"Partner: @{balance['partner_username']}\n"
-        msg += f"Shared net: ${balance['shared_balance']:.2f}\n"
-        if balance['shared_balance'] > 0:
-            msg += "Your partner owes you."
-        elif balance['shared_balance'] < 0:
-            msg += "You owe your partner."
-        else:
-            msg += "Shared spending is even."
+        partner_id = get_partner_id(user.id)
+        partner_balance = get_user_balance(partner_id)
+        msg += f"@{balance['partner_username']} spent: ${partner_balance['total']:.2f}\n"
+        msg += f"\nTotal: ${balance['total'] + partner_balance['total']:.2f}"
     else:
-        msg += "No partner linked yet. Use /partner @username"
+        msg += "\nNo partner linked yet. Use /partner @username"
 
     await update.message.reply_text(msg)
 
@@ -463,10 +447,8 @@ async def view_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"Week: {format_week_range(current_week_start())}\n\n"
     for e in expenses[:10]:
         owner = e['paid_by'] or f"user_{e['user_id']}"
-        scope = 'Shared' if e['is_shared'] else 'Personal'
         msg += f"• ${e['amount']:.2f} — {e['description']} ({e['category']})\n"
-        msg += f"  paid by @{owner} | {scope}\n"
-        msg += f"  {e['created_at'][:10]}\n\n"
+        msg += f"  by @{owner} on {e['created_at'][:10]}\n\n"
 
     if len(expenses) > 10:
         msg += f"Showing latest 10 of {len(expenses)} expenses.\n\n"
@@ -511,6 +493,12 @@ async def weekly_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, week_start = query.data.split(':', 1)
     await send_weekly_report(update, context, week_start)
 
+# ── Weekly Reset ──────────────────────────────────────────────────────────────
+
+async def weekly_reset_job():
+    """Log weekly reset (data persists, just marking the boundary)."""
+    logger.info("📅 Weekly reset triggered at end of Sunday. Fresh week starting Monday!")
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -528,19 +516,21 @@ Commands:
 
 Buttons:
 ➕ Add Expense - Record a new expense
-💰 My Balance - Check your balance
+💰 Our Balance - Check your balance
 📊 View Expenses - See recent expenses
+📅 WEEKLY - Browse expenses by week
 ✏️ Edit Expense - Edit one of your expenses
 🗑 Delete Expense - Remove an expense
 🔗 Set Partner - Link your partner account
 ❓ Help - Show this message
 
 How it works:
-1. Each person tracks their own expenses
+1. Each person has a personal account for tracking expenses
 2. Link accounts once with /partner @username
-3. Shared expenses split 50/50 automatically
-4. Weekly totals reset automatically every Monday
-5. Use /weekly or the WEEKLY button to browse past weeks
+3. Mark expenses as personal or split 50/50 with partner
+4. Split expenses automatically add to both personal accounts
+5. Weekly totals reset automatically every Monday
+6. Use /weekly or the WEEKLY button to browse past weeks
 """)
 
 # ── Error handler ──────────────────────────────────────────────────────────────
@@ -604,13 +594,22 @@ def main():
     app.add_handler(add_conv)
     app.add_handler(delete_conv)
     app.add_handler(edit_conv)
-    app.add_handler(MessageHandler(filters.Regex('^💰 My Balance$'), view_balance))
+    app.add_handler(MessageHandler(filters.Regex('^💰 Our Balance$'), view_balance))
     app.add_handler(MessageHandler(filters.Regex('^📊 View Expenses$'), view_expenses))
     app.add_handler(MessageHandler(filters.Regex('^📅 WEEKLY$'), weekly_command))
     app.add_handler(MessageHandler(filters.Regex('^🔗 Set Partner$'), set_partner_command))
     app.add_handler(MessageHandler(filters.Regex('^❓ Help$'), help_command))
     app.add_handler(CallbackQueryHandler(weekly_callback, pattern=r'^weekly:'))
     app.add_error_handler(error_handler)
+
+    # Set up weekly reset scheduler for Sunday at 23:59
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        weekly_reset_job,
+        CronTrigger(day_of_week=6, hour=23, minute=59),  # Sunday at 23:59
+        name='weekly_reset'
+    )
+    app.post_init = lambda: scheduler.start()
 
     logger.info("Bot started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
